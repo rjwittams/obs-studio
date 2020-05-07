@@ -5,6 +5,7 @@
 
 struct device_item {
 	struct dstr name, value;
+	bool is_default;
 };
 
 static inline void device_item_free(struct device_item *item)

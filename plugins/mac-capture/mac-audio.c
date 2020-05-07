@@ -22,7 +22,6 @@
 #define BUS_INPUT 1
 
 #define MAX_DEVICES 20
-#define MIN_SELECTED_CHANNELS 1
 
 #define set_property AudioUnitSetProperty
 #define get_property AudioUnitGetProperty
@@ -31,7 +30,6 @@
 #define TEXT_AUDIO_OUTPUT obs_module_text("CoreAudio.OutputCapture");
 #define TEXT_DEVICE obs_module_text("CoreAudio.Device")
 #define TEXT_DEVICE_DEFAULT obs_module_text("CoreAudio.Device.Default")
-#define TEXT_SELECTED_CHANNELS obs_module_text("CoreAudio.SelectedChannels")
 
 struct coreaudio_data {
 	char *device_name;
@@ -45,10 +43,12 @@ struct coreaudio_data {
 	bool input;
 	bool no_devices;
 
-	uint32_t sample_rate;
-	uint8_t available_channels;
+
+	uint32_t available_channels;
 	char **channel_names;
-	uint64_t selected_channels_bitset;
+	int32_t* channel_map;
+
+        uint32_t sample_rate;
 	enum audio_format format;
 	enum speaker_layout speakers;
 
@@ -194,26 +194,24 @@ static inline enum audio_format convert_ca_format(UInt32 format_flags,
 	return AUDIO_FORMAT_UNKNOWN;
 }
 
-static inline enum speaker_layout convert_ca_speaker_layout(UInt32 channels)
+static char* sanitise_device_name(char* name)
 {
-	switch (channels) {
-	case 1:
-		return SPEAKERS_MONO;
-	case 2:
-		return SPEAKERS_STEREO;
-	case 3:
-		return SPEAKERS_2POINT1;
-	case 4:
-		return SPEAKERS_4POINT0;
-	case 5:
-		return SPEAKERS_4POINT1;
-	case 6:
-		return SPEAKERS_5POINT1;
-	case 8:
-		return SPEAKERS_7POINT1;
-	}
+	const size_t max_len = 64;
+	size_t len = strlen(name);
+        char buf[max_len];
+	size_t out_idx = 0;
 
-	return SPEAKERS_UNKNOWN;
+	for(size_t i = len > max_len ? len - max_len : 0;
+	     i < len; i++ ){
+		char c = name[i];
+		if(isalnum(c) ){
+			buf[out_idx++] = name[i];
+		}
+		if(c == '-' || c == ' ' || c == '_' || c == ':'){
+		        buf[out_idx++] = '_';
+		}
+	}
+        return bstrdup_n(buf, out_idx);
 }
 
 static char **coreaudio_get_channel_names(struct coreaudio_data *ca)
@@ -236,7 +234,7 @@ static char **coreaudio_get_channel_names(struct coreaudio_data *ca)
 			       "get channel names") &&
 		    CFStringGetLength(cf_chan_name)) {
 			dstr_printf(
-				&name, "%d - %s", i + 0,
+				&name, "%d - %s", i + 1,
 				CFStringGetCStringPtr(cf_chan_name,
 						      kCFStringEncodingUTF8));
 		} else {
@@ -253,50 +251,60 @@ static char **coreaudio_get_channel_names(struct coreaudio_data *ca)
 	return channel_names;
 }
 
-static uint8_t coreaudio_fill_channel_map(const struct coreaudio_data *ca,
-					  SInt32 *channel_map)
-{
-	uint8_t num_channels_sel = 0;
-	for (uint8_t i = 0;
-	     i < ca->available_channels && num_channels_sel < MAX_AV_PLANES;
-	     i++) {
-		if (ca->selected_channels_bitset & (1UL << i)) {
-			channel_map[num_channels_sel++] = i;
-		}
-	}
-	// Select at least the first channel
-	if (num_channels_sel == 0) {
-		channel_map[num_channels_sel++] = 0;
-	}
-	return num_channels_sel;
-}
-
 static bool coreaudio_init_format(struct coreaudio_data *ca)
 {
 	AudioStreamBasicDescription desc;
 	OSStatus stat;
-	UInt32 size = sizeof(desc);
+        UInt32 size;
+	struct obs_audio_info aoi;
+        if (!obs_get_audio_info(&aoi)) {
+                blog(LOG_WARNING, "No active audio");
+                return false;
+        }
+        ca->speakers = aoi.speakers;
+        uint32_t channels = get_audio_channels(ca->speakers);
+
+	size = sizeof(desc);
 	stat = get_property(ca->unit, kAudioUnitProperty_StreamFormat,
 			    SCOPE_INPUT, BUS_INPUT, &desc, &size);
 	if (!ca_success(stat, ca, "coreaudio_init_format", "get input format"))
 		return false;
 
-	ca->available_channels = desc.mChannelsPerFrame;
+        ca->available_channels = desc.mChannelsPerFrame;
+	if(ca->available_channels > MAX_DEVICE_INPUT_CHANNELS){
+		ca->available_channels = MAX_DEVICE_INPUT_CHANNELS;
+	}
 
 	ca->channel_names = coreaudio_get_channel_names(ca);
 
-	// Work out the channel map - up to the max number of outputs
-	SInt32 channel_map[MAX_AV_PLANES];
-	uint8_t num_channels_sel = coreaudio_fill_channel_map(ca, channel_map);
 
-	// Always work out the format from the actual number of channels selected
-	desc.mChannelsPerFrame = num_channels_sel;
-	desc.mBytesPerFrame = num_channels_sel * desc.mBitsPerChannel / 8;
+	// Always work out the format from the number of channels in the speaker layout
+	desc.mChannelsPerFrame = channels;
+	desc.mBytesPerFrame = desc.mChannelsPerFrame * desc.mBitsPerChannel / 8;
 	desc.mBytesPerPacket = desc.mFramesPerPacket * desc.mBytesPerFrame;
 
+	blog(LOG_INFO, "channels %d mBytesPerFrame %d mBytesPerPacket %d framesPerPAcket %d",
+	     channels, desc.mBytesPerFrame, desc.mBytesPerPacket, desc.mFramesPerPacket);
+
+	// Mute any channels mapped in config that we don't really have
+        char* sep = "";
+	struct dstr cm_str;
+	dstr_init(&cm_str);
+	for (size_t i = 0; i < channels; i++) {
+		dstr_cat(&cm_str, sep);
+		if(ca->channel_map[i] >= (int32_t)ca->available_channels) {
+			ca->channel_map[i] = -1;
+			blog(LOG_INFO, "Muting %d", i);
+		}
+	        dstr_catf(&cm_str, "%d", ca->channel_map[i]);
+	        sep = ",";
+	}
+        blog(LOG_INFO, "Channel map [%s]. Inputs: %d", cm_str.array, ca->available_channels);
+	dstr_free(&cm_str);
+
 	stat = set_property(ca->unit, kAudioOutputUnitProperty_ChannelMap,
-			    SCOPE_INPUT, BUS_INPUT, channel_map,
-			    sizeof(channel_map[0]) * num_channels_sel);
+			    SCOPE_INPUT, BUS_INPUT, ca->channel_map,
+			    sizeof(SInt32) * channels);
 	if (!ca_success(stat, ca, "coreaudio_init_format", "set channel map"))
 		return false;
 
@@ -321,15 +329,6 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 	}
 
 	ca->sample_rate = (uint32_t)desc.mSampleRate;
-	ca->speakers = convert_ca_speaker_layout(num_channels_sel);
-
-	//	if (ca->speakers == SPEAKERS_UNKNOWN) {
-	//		ca_warn(ca, "coreaudio_init_format",
-	//			"unknown speaker layout: "
-	//			"%u channels",
-	//			(unsigned int)num_channels_sel);
-	//		return false;
-	//	}
 
 	return true;
 }
@@ -359,21 +358,28 @@ static bool coreaudio_init_buffer(struct coreaudio_data *ca)
 
 	/* ---------------------- */
 
-	ca->buf_list = bmalloc(buf_size);
+        AudioBufferList *buf_list = bmalloc(buf_size);
 
 	stat = AudioObjectGetPropertyData(ca->device_id, &addr, 0, NULL,
-					  &buf_size, ca->buf_list);
+					  &buf_size, buf_list);
 	if (!ca_success(stat, ca, "coreaudio_init_buffer", "allocate")) {
-		bfree(ca->buf_list);
-		ca->buf_list = NULL;
+		bfree(buf_list);
+		buf_list = NULL;
 		return false;
 	}
 
-	for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++) {
-		size = ca->buf_list->mBuffers[i].mDataByteSize;
-		ca->buf_list->mBuffers[i].mData = bmalloc(size);
+	int channels = get_audio_channels(ca->speakers);
+	for (UInt32 i = 0; i < buf_list->mNumberBuffers; i++) {
+		// The returned buffer seems to ignore the channel mapping
+                uint chan_size = buf_list->mBuffers[i].mDataByteSize /
+				buf_list->mBuffers[i].mNumberChannels;
+                buf_list->mBuffers[i].mDataByteSize = chan_size * channels;
+		buf_list->mBuffers[i].mNumberChannels = channels;
+		size = buf_list->mBuffers[i].mDataByteSize;
+		buf_list->mBuffers[i].mData = bmalloc(size);
 	}
 
+        ca->buf_list = buf_list;
 	return true;
 }
 
@@ -735,6 +741,11 @@ static void coreaudio_uninit(struct coreaudio_data *ca)
 		bfree(ca->channel_names);
 		ca->channel_names = NULL;
 	}
+
+	if(ca->channel_map){
+		bfree(ca->channel_map);
+		ca->channel_map = NULL;
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -782,18 +793,23 @@ static void coreaudio_destroy(void *data)
 static void coreaudio_set_channels(struct coreaudio_data *ca,
 				   obs_data_t *settings)
 {
-	ca->selected_channels_bitset = 0;
-	for (uint8_t i = 0; i < MAX_DEVICE_INPUT_CHANNELS; i++) {
-		char setting_name[32];
-		snprintf(setting_name, 32, "channel-%i", i + 1);
-		bool enabled =
+	ca->channel_map = bzalloc(sizeof(SInt32) * MAX_AV_PLANES);
+
+        char* device_config_name = sanitise_device_name(ca->device_uid);
+	for (uint8_t i = 0; i < MAX_AV_PLANES; i++) {
+		char setting_name[128];
+		snprintf(setting_name, 128, "output-%s-%i",
+			 device_config_name, i + 1);
+		int64_t found =
 			obs_data_has_user_value(settings, setting_name)
-				? obs_data_get_bool(settings, setting_name)
-				: false;
-		if (enabled) {
-			ca->selected_channels_bitset |= 1UL << i;
-		}
+				? obs_data_get_int(settings, setting_name)
+				: -1L;
+		int64_t adjusted = found > 0 ? found - 1 : -1;
+		ca->channel_map[i] = (int32_t) adjusted;
+		blog(LOG_INFO, "Load cm: name %s found %d adj %d, channel_map[%d]= %d",
+		     setting_name, found, adjusted, i, ca->channel_map[i]);
 	}
+	bfree(device_config_name);
 }
 
 static void coreaudio_update(void *data, obs_data_t *settings)
@@ -852,104 +868,92 @@ static void *coreaudio_create_output_capture(obs_data_t *settings,
 	return coreaudio_create(settings, source, false);
 }
 
-static void coreaudio_properties_warning(obs_properties_t *props,
-					 obs_data_t *settings,
-					 const char *warning)
+static void coreaudio_fill_combo_with_inputs(const struct coreaudio_data *ca,
+					      uint32_t out_chan,
+					      obs_property_t *input_combo)
 {
-	obs_property_t *warn_prop = obs_properties_get(props, "warning");
-	obs_property_set_visible(warn_prop, warning != NULL);
-	obs_data_set_default_string(settings, "warning",
-				    warning ? warning : "");
+	obs_property_list_clear(input_combo);
+        bool defaulted = out_chan < ca->available_channels;
+        if (defaulted) {
+                struct dstr default_name;
+                dstr_init(&default_name);
+                dstr_printf(&default_name, "%s [Default]", ca->channel_names[out_chan]);
+                obs_property_list_add_int(input_combo, default_name.array, out_chan + 1);
+                dstr_free(&default_name);
+        } else {
+                obs_property_list_add_int(input_combo, "Mute [Default]", -1);
+        }
+
+        for(uint32_t input_chan = 0; input_chan < ca->available_channels; input_chan++){
+                if(!defaulted || input_chan != out_chan) {
+                        obs_property_list_add_int(
+                                input_combo,
+                                ca->channel_names[input_chan],
+                                input_chan + 1);
+                }
+        }
+
+        if(defaulted){
+                obs_property_list_add_int(input_combo, "Mute", -1);
+        }
+}
+
+static void ensure_output_channel_prop(const struct coreaudio_data *ca,
+                                obs_properties_t *props,
+                                const char *device_config_name,
+                                uint32_t out_chan)
+{
+        struct dstr name;
+        dstr_init(&name);
+        dstr_printf(&name, "output-%s-%d", device_config_name, out_chan + 1);
+
+        obs_property_t* prop = obs_properties_get(props, name.array);
+
+
+        if(prop) {
+                obs_property_set_visible(prop, true);
+        } else {
+                struct dstr label;
+                dstr_init(&label);
+                dstr_printf(&label, "Output %i", out_chan + 1);
+                obs_property_t *input_combo = obs_properties_add_list(
+                        props, name.array, label.array, OBS_COMBO_TYPE_LIST,
+                        OBS_COMBO_FORMAT_INT);
+                dstr_free(&label);
+                coreaudio_fill_combo_with_inputs(ca, out_chan, input_combo);
+        }
+	dstr_free(&name);
+}
+
+static void ensure_output_channels_visible(obs_properties_t *props,
+                                           const struct coreaudio_data *ca,
+                                           uint32_t channels)
+{
+        char* device_config_name = sanitise_device_name(ca->device_uid);
+        for (uint32_t out_chan = 0; out_chan < channels; out_chan++){
+                ensure_output_channel_prop(ca, props, device_config_name,
+                                           out_chan);
+        }
+        bfree(device_config_name);
 }
 
 static bool coreaudio_device_changed(void *data, obs_properties_t *props,
-				     obs_property_t *p, obs_data_t *settings)
+                                     obs_property_t *p, obs_data_t *settings)
 {
-	const int max_channels = MAX_AV_PLANES;
-	// This could be determined by the global speaker layout.
-	// But that would preclude subsequent filters from mixing down to fewer
-	struct coreaudio_data *ca = data;
-	const char *prop_val =
-		obs_data_get_string(settings, obs_property_name(p));
-	obs_properties_remove_by_name(props, "selected_channels");
-	if (ca && ca->au_initialized) {
+        struct coreaudio_data *ca = data;
+	if (ca != NULL) {
+		blog(LOG_INFO, "Clearing channel settings");
+		uint32_t channels = get_audio_channels(ca->speakers);
 
-		blog(LOG_INFO, "core audio: device changed %s - ca device %s",
-		     prop_val, ca->device_name);
-
-		obs_properties_t *chan_props = obs_properties_create();
-		obs_properties_add_group(props, "selected_channels",
-					 TEXT_SELECTED_CHANNELS,
-					 OBS_GROUP_NORMAL, chan_props);
-
-		uint8_t sel_count = 0;
-
-		for (uint32_t i = 0; i < ca->available_channels; i++) {
-			char name[32];
-			snprintf(name, 32, "channel-%i", i + 1);
-			obs_property_t *chan_prop = obs_properties_add_bool(
-				chan_props, name, ca->channel_names[i]);
-
-			bool is_selected;
-			if (!obs_data_has_user_value(settings, name)) {
-				is_selected = sel_count < max_channels;
-				obs_data_set_bool(settings, name, is_selected);
-			} else {
-				is_selected = obs_data_get_bool(settings, name);
-				if (sel_count >= max_channels) {
-					is_selected = false;
-					obs_data_set_bool(settings, name,
-							  is_selected);
-				}
+		for (obs_property_t *prop = obs_properties_first(props);
+		     prop != NULL; obs_property_next(&prop)) {
+			const char *prop_name = obs_property_name(prop);
+			if (strncmp("output-", prop_name, 7) == 0) {
+				obs_property_set_visible(prop, false);
 			}
-			sel_count += is_selected;
-			obs_property_set_modified_callback2(
-				chan_prop, coreaudio_device_changed, ca);
 		}
-		bool at_max = sel_count >= max_channels;
-		bool at_min = sel_count <= MIN_SELECTED_CHANNELS;
-
-		// If we are at max or min disable props that would make us go over
-		if (at_max || at_min) {
-			obs_property_t *chan_prop =
-				obs_properties_first(chan_props);
-			do {
-				bool is_selected = obs_data_get_bool(
-					settings, obs_property_name(chan_prop));
-				blog(LOG_INFO,
-				     "enabling is_selected %d min %d max %d %s",
-				     is_selected, at_min, at_max,
-				     obs_property_name(chan_prop));
-				if ((at_max && !is_selected) ||
-				    (at_min && is_selected)) {
-					obs_property_set_enabled(chan_prop,
-								 false);
-					blog(LOG_INFO, "disabling %s ",
-					     obs_property_name(chan_prop));
-				}
-			} while (obs_property_next(&chan_prop));
-		}
-		enum speaker_layout speakers =
-			convert_ca_speaker_layout(sel_count);
-
-		if (speakers == SPEAKERS_UNKNOWN) {
-			char buf[64];
-			snprintf(buf, 64, "Unknown speaker layout: %u channels",
-				 sel_count);
-			coreaudio_properties_warning(props, settings, buf);
-		} else {
-			char *warning =
-				at_max ? "Maximum channels selected"
-				       : at_min ? "Minimum channels selected"
-						: NULL;
-			coreaudio_properties_warning(props, settings, warning);
-		}
-	} else {
-		coreaudio_properties_warning(
-			props, settings,
-			"Core audio unit could not be initialised");
+		ensure_output_channels_visible(props, ca, channels);
 	}
-
 	return true;
 }
 
@@ -978,13 +982,13 @@ static obs_properties_t *coreaudio_properties(bool input, void *data)
 					     item->value.array);
 	}
 
-	obs_property_t *warn_prop = obs_properties_add_text(
-		props, "warning", "Warning", OBS_TEXT_DEFAULT);
-	obs_property_set_enabled(warn_prop, false);
-	obs_property_set_visible(warn_prop, false);
+        obs_property_set_modified_callback2(
+                property, coreaudio_device_changed, ca);
 
-	obs_property_set_modified_callback2(property, coreaudio_device_changed,
-					    ca);
+	if(ca != NULL) {
+		uint32_t channels = get_audio_channels(ca->speakers);
+		ensure_output_channels_visible(props, ca, channels);
+	}
 
 	device_list_free(&devices);
 	return props;
