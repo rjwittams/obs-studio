@@ -280,11 +280,6 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 	desc.mBytesPerFrame = desc.mChannelsPerFrame * desc.mBitsPerChannel / 8;
 	desc.mBytesPerPacket = desc.mFramesPerPacket * desc.mBytesPerFrame;
 
-	blog(LOG_INFO,
-	     "channels %d mBytesPerFrame %d mBytesPerPacket %d framesPerPAcket %d",
-	     channels, desc.mBytesPerFrame, desc.mBytesPerPacket,
-	     desc.mFramesPerPacket);
-
 	// Mute any channels mapped in config that we don't really have
 	char *sep = "";
 	struct dstr cm_str;
@@ -298,7 +293,7 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 		dstr_catf(&cm_str, "%d", ca->channel_map[i]);
 		sep = ",";
 	}
-	blog(LOG_INFO, "Channel map [%s]. Inputs: %d", cm_str.array,
+	blog(LOG_INFO, "Channel map [%s]. Inputs available: %d", cm_str.array,
 	     ca->available_channels);
 	dstr_free(&cm_str);
 
@@ -370,7 +365,11 @@ static bool coreaudio_init_buffer(struct coreaudio_data *ca)
 
 	int channels = get_audio_channels(ca->speakers);
 	for (UInt32 i = 0; i < buf_list->mNumberBuffers; i++) {
-		// The returned buffer seems to ignore the channel mapping
+		// The returned buffer seems to ignore the channel mapping.
+		// This corrects it to take that into account -
+		// but this probably wouldn't work for planar formats.
+		// We are probably better off explicitly setting the format we want,
+		// and just taking sample rate from the device
 		uint chan_size = buf_list->mBuffers[i].mDataByteSize /
 				 buf_list->mBuffers[i].mNumberChannels;
 		buf_list->mBuffers[i].mDataByteSize = chan_size * channels;
@@ -944,16 +943,7 @@ static bool coreaudio_device_changed(void *data, obs_properties_t *props,
 {
 	struct coreaudio_data *ca = data;
 	if (ca != NULL) {
-		blog(LOG_INFO, "Clearing channel settings");
 		uint32_t channels = get_audio_channels(ca->speakers);
-
-		for (obs_property_t *prop = obs_properties_first(props);
-		     prop != NULL; obs_property_next(&prop)) {
-			const char *prop_name = obs_property_name(prop);
-			if (strncmp("output-", prop_name, 7) == 0) {
-				obs_property_set_visible(prop, false);
-			}
-		}
 		ensure_output_channels_visible(props, ca, channels);
 	}
 	return true;

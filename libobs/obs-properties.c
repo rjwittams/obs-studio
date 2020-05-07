@@ -379,20 +379,9 @@ void obs_properties_apply_settings_internal(obs_properties_t *props,
 	p = props->first_property;
 	while (p) {
 		if (p->type == OBS_PROPERTY_GROUP) {
-			// RJW Crashes seen, looks like memory corruption of the group contents
-			obs_properties_t *group_content =
-				obs_property_group_content(p);
-			if (group_content != NULL) {
-				blog(LOG_WARNING,
-				     "Applying group content for property %s content properties pointer %x",
-				     obs_property_name(p), group_content);
-				obs_properties_apply_settings_internal(
-					group_content, settings, realprops);
-			} else {
-				blog(LOG_ERROR,
-				     "Could not get property group content for property %s",
-				     obs_property_name(p));
-			}
+			obs_properties_apply_settings_internal(
+				obs_property_group_content(p), settings,
+				realprops);
 		}
 		if (p->modified)
 			p->modified(realprops, p, settings);
@@ -400,7 +389,6 @@ void obs_properties_apply_settings_internal(obs_properties_t *props,
 			p->modified2(p->priv, realprops, p, settings);
 		p = p->next;
 	}
-	blog(LOG_WARNING, "Hanging onto props pointer %x", props);
 }
 
 void obs_properties_apply_settings(obs_properties_t *props,
