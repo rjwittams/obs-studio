@@ -26,7 +26,8 @@ static inline bool enum_success(OSStatus stat, const char *msg)
 }
 
 typedef bool (*enum_device_proc_t)(void *param, CFStringRef cf_name,
-				   CFStringRef cf_uid, AudioDeviceID id, bool is_default_device);
+				   CFStringRef cf_uid, AudioDeviceID id,
+				   bool is_default_device);
 
 static bool coreaudio_enum_device(enum_device_proc_t proc, void *param,
 				  AudioDeviceID id, bool is_default_device)
@@ -89,25 +90,25 @@ static void enum_devices(enum_device_proc_t proc, bool input, void *param)
 
 	stat = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0,
 					  NULL, &size, ids);
-        if (!enum_success(stat, "get kAudioObjectSystemObject data"))
-	        return;
+	if (!enum_success(stat, "get kAudioObjectSystemObject data"))
+		return;
 
-	addr.mSelector = input? kAudioHardwarePropertyDefaultInputDevice
-			       :kAudioHardwarePropertyDefaultOutputDevice;
+	addr.mSelector = input ? kAudioHardwarePropertyDefaultInputDevice
+			       : kAudioHardwarePropertyDefaultOutputDevice;
 
 	AudioDeviceID default_id;
 	size = sizeof(AudioDeviceID);
-        stat = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0,
-                                          NULL, &size, &default_id);
-        if (!enum_success(stat, "get kAudioObjectSystemObject default device id"))
-                return;
+	stat = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0,
+					  NULL, &size, &default_id);
+	if (!enum_success(stat,
+			  "get kAudioObjectSystemObject default device id"))
+		return;
 
-
-        if (enum_success(stat, "get kAudioObjectSystemObject data"))
+	if (enum_success(stat, "get kAudioObjectSystemObject data"))
 		for (UInt32 i = 0; i < count; i++)
-			if (!coreaudio_enum_device(proc, param, ids[i], ids[i] == default_id))
+			if (!coreaudio_enum_device(proc, param, ids[i],
+						   ids[i] == default_id))
 				break;
-
 
 	bfree(ids);
 }
@@ -118,7 +119,8 @@ struct add_data {
 };
 
 static bool coreaudio_enum_add_device(void *param, CFStringRef cf_name,
-				      CFStringRef cf_uid, AudioDeviceID id, bool is_default_device)
+				      CFStringRef cf_uid, AudioDeviceID id,
+				      bool is_default_device)
 {
 	struct add_data *data = param;
 	struct device_item item;
@@ -129,7 +131,7 @@ static bool coreaudio_enum_add_device(void *param, CFStringRef cf_name,
 		goto fail;
 	if (!cfstr_copy_dstr(cf_uid, kCFStringEncodingUTF8, &item.value))
 		goto fail;
-        item.is_default = is_default_device;
+	item.is_default = is_default_device;
 
 	if (data->input || !device_is_input(item.value.array))
 		device_list_add(data->list, &item);
