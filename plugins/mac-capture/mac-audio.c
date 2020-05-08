@@ -288,7 +288,6 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 		dstr_cat(&cm_str, sep);
 		if (ca->channel_map[i] >= (int32_t)ca->available_channels) {
 			ca->channel_map[i] = -1;
-			blog(LOG_INFO, "Muting %d", i);
 		}
 		dstr_catf(&cm_str, "%d", ca->channel_map[i]);
 		sep = ",";
@@ -805,9 +804,6 @@ static void coreaudio_set_channels(struct coreaudio_data *ca,
 				: -1L;
 		int64_t adjusted = found > 0 ? found - 1 : -1;
 		ca->channel_map[i] = (int32_t)adjusted;
-		blog(LOG_INFO,
-		     "Load cm: name %s found %d adj %d, channel_map[%d]= %d",
-		     setting_name, found, adjusted, i, ca->channel_map[i]);
 	}
 	bfree(device_config_name);
 }
@@ -946,6 +942,8 @@ static bool coreaudio_device_changed(void *data, obs_properties_t *props,
 		uint32_t channels = get_audio_channels(ca->speakers);
 		ensure_output_channels_visible(props, ca, channels);
 	}
+	UNUSED_PARAMETER(p);
+	UNUSED_PARAMETER(settings);
 	return true;
 }
 
